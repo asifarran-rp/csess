@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""csess - keep, browse, hydrate and prune long-lived Claude Code sessions.
+
+Zero dependencies (Python stdlib only). Owns a small registry of "kept"
+sessions, preserves a copy of each transcript so Claude Code's auto-cleanup
+can't silently delete it, and gives an arrow-key picker to resume one.
+
+Layout (~/.claude/csess/):
+  index.json            registry of kept sessions
+  transcripts/<id>.jsonl  preserved copy of each kept transcript
+  summaries/<id>.md       human/agent-written summary of the session
+
+Usage:
+  csess                       arrow-key picker -> resume the chosen session
+  csess ls                    plain text list (no TTY needed)
+  csess prune                 multi-select picker -> delete chosen sessions
+  csess resume <id|label>     resume a specific session directly
+  csess rm <id|label> ...     delete specific sessions (no picker)
+  csess save --id <id> --cwd <dir> [--label L] [--summary-file F]
+                              register/refresh a session (used by /keep)
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.path.join(HOME, ".claude")
+BASE = os.path.join(CLAUDE_DIR, "csess")
+INDEX = os.path.join(BASE, "index.json")
+TRANSCRIPTS = os.path.join(BASE, "transcripts")
+SUMMARIES = os.path.join(BASE, "summaries")
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+
+
+# ---------- registry helpers ----------
+
+def ensure_dirs():
+    os.makedirs(TRANSCRIPTS, exist_ok=True)
+    os.makedirs(SUMMARIES, exist_ok=True)
+
+
+def load_index():
+    try:
+        with open(INDEX) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_index(entries):
+    ensure_dirs()
+    fd, tmp = tempfile.mkstemp(dir=BASE, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(entries, f, indent=2)
+    os.replace(tmp, INDEX)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- transcript discovery ----------
+
+def find_live_transcript(session_id):
+    """Locate the transcript Claude Code is writing, in any project dir."""
+    hits = glob.glob(os.path.join(PROJECTS, "*", f"{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def slug_for_cwd(cwd):
+    """Mirror Claude Code's project-dir naming: '/' and '.' -> '-'."""
+    return re.sub(r"[/.]", "-", cwd)
+
+
+def project_dir_for(entry):
+    if entry.get("project_dir") and os.path.isdir(entry["project_dir"]):
+        return entry["project_dir"]
+    return os.path.join(PROJECTS, slug_for_cwd(entry.get("cwd", "")))
+
+
+def preserved_path(session_id):
+    return os.path.join(TRANSCRIPTS, f"{session_id}.jsonl")
+
+
+def summary_path(session_id):
+    return os.path.join(SUMMARIES, f"{session_id}.md")
+
+
+def first_user_message(transcript_path):
+    """Grab a short preview from the first real user turn."""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                msg = obj.get("message", {})
+                content = msg.get("content", msg)
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            break
+                        if isinstance(block, str):
+                            text = block
+                            break
+                text = " ".join(text.split())
+                # skip command/system noise
+                if text and not text.startswith("<"):
+                    return text[:200]
+    except OSError:
+        pass
+    return ""
+
+
+def last_activity(entry):
+    """Newest known activity: live transcript, then preserved copy, then saved time."""
+    times = []
+    live = find_live_transcript(entry["id"])
+    if live:
+        times.append(os.path.getmtime(live))
+    pres = preserved_path(entry["id"])
+    if os.path.exists(pres):
+        times.append(os.path.getmtime(pres))
+    if times:
+        return max(times)
+    # fall back to recorded timestamp
+    for key in ("updated_at", "saved_at"):
+        if entry.get(key):
+            try:
+                return datetime.strptime(
+                    entry[key], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                pass
+    return 0.0
+
+
+def sorted_entries():
+    entries = load_index()
+    for e in entries:
+        e["_last"] = last_activity(e)
+    entries.sort(key=lambda e: e["_last"], reverse=True)
+    return entries
+
+
+def reltime(ts):
+    if not ts:
+        return "unknown"
+    delta = datetime.now(timezone.utc).timestamp() - ts
+    if delta < 60:
+        return "just now"
+    for unit, secs in (("d", 86400), ("h", 3600), ("m", 60)):
+        if delta >= secs:
+            return f"{int(delta // secs)}{unit} ago"
+    return "just now"
+
+
+def find_entry(entries, ref):
+    """Match a ref against id (prefix) or label (case-insensitive)."""
+    for e in entries:
+        if e["id"] == ref:
+            return e
+    matches = [e for e in entries
+               if e["id"].startswith(ref) or e.get("label", "").lower() == ref.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        matches = [e for e in entries if ref.lower() in e.get("label", "").lower()]
+        if len(matches) == 1:
+            return matches[0]
+    return None if len(matches) != 1 else matches[0]
+
+
+# ---------- commands ----------
+
+def cmd_save(args):
+    ensure_dirs()
+    session_id = args.id or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        print("error: no --id and CLAUDE_CODE_SESSION_ID is not set", file=sys.stderr)
+        return 1
+    cwd = args.cwd or os.getcwd()
+
+    live = find_live_transcript(session_id)
+    project_dir = os.path.dirname(live) if live else os.path.join(PROJECTS, slug_for_cwd(cwd))
+
+    # preserve a copy so auto-cleanup can't delete it
+    if live:
+        shutil.copy2(live, preserved_path(session_id))
+        preview = first_user_message(live)
+    elif os.path.exists(preserved_path(session_id)):
+        preview = first_user_message(preserved_path(session_id))
+    else:
+        print(f"warning: no transcript found for {session_id} (saved metadata only)",
+              file=sys.stderr)
+        preview = ""
+
+    if args.summary_file and os.path.exists(args.summary_file):
+        shutil.copy2(args.summary_file, summary_path(session_id))
+
+    entries = load_index()
+    existing = next((e for e in entries if e["id"] == session_id), None)
+    label = args.label or (existing.get("label") if existing else None) \
+        or (preview[:48] if preview else session_id[:8])
+
+    record = existing or {"id": session_id, "saved_at": now_iso()}
+    record.update({
+        "label": label,
+        "cwd": cwd,
+        "project_dir": project_dir,
+        "updated_at": now_iso(),
+        "preview": preview or record.get("preview", ""),
+        "has_summary": os.path.exists(summary_path(session_id)),
+    })
+    if existing is None:
+        entries.append(record)
+    for e in entries:
+        e.pop("_last", None)  # never persist the transient sort key
+    save_index(entries)
+    print(f"kept: {label}  ({session_id})")
+    print(f"  transcript preserved -> {preserved_path(session_id)}")
+    if record["has_summary"]:
+        print(f"  summary -> {summary_path(session_id)}")
+    return 0
+
+
+def cmd_ls(args):
+    entries = sorted_entries()
+    if not entries:
+        print("no kept sessions. use /keep inside a session to save one.")
+        return 0
+    for e in entries:
+        live = "" if find_live_transcript(e["id"]) else " [archived]"
+        mark = " *" if e.get("has_summary") else "  "
+        print(f"{reltime(e['_last']):>9}{mark} {e.get('label','(no label)')}{live}")
+        print(f"            {e['id']}  {e.get('cwd','')}")
+        if e.get("preview"):
+            print(f"            > {e['preview'][:100]}")
+    return 0
+
+
+def restore_if_needed(entry):
+    """Make sure the transcript is back in the project dir so `claude -r` finds it."""
+    pdir = project_dir_for(entry)
+    target = os.path.join(pdir, f"{entry['id']}.jsonl")
+    if not os.path.exists(target):
+        pres = preserved_path(entry["id"])
+        if os.path.exists(pres):
+            os.makedirs(pdir, exist_ok=True)
+            shutil.copy2(pres, target)
+            return True
+    return False
+
+
+def do_resume(entry):
+    cwd = entry.get("cwd") or HOME
+    if not os.path.isdir(cwd):
+        print(f"error: original directory is gone: {cwd}", file=sys.stderr)
+        return 1
+    restored = restore_if_needed(entry)
+    if restored:
+        print(f"restored archived transcript into {project_dir_for(entry)}")
+    print(f"resuming: {entry.get('label')}  ({entry['id']})")
+    os.chdir(cwd)
+    try:
+        os.execvp("claude", ["claude", "-r", entry["id"]])
+    except OSError as exc:
+        print(f"error launching claude: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_resume(args):
+    entries = sorted_entries()
+    e = find_entry(entries, args.ref)
+    if not e:
+        print(f"no unique match for '{args.ref}'", file=sys.stderr)
+        return 1
+    return do_resume(e)
+
+
+def cmd_rm(args):
+    entries = load_index()
+    removed = []
+    keep = []
+    for e in entries:
+        if any(e["id"] == r or e["id"].startswith(r)
+               or e.get("label", "").lower() == r.lower() for r in args.refs):
+            removed.append(e)
+        else:
+            keep.append(e)
+    for e in removed:
+        for p in (preserved_path(e["id"]), summary_path(e["id"])):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    save_index(keep)
+    if removed:
+        for e in removed:
+            print(f"removed: {e.get('label')} ({e['id']})")
+    else:
+        print("nothing matched.")
+    return 0
+
+
+# ---------- curses pickers ----------
+
+def _require_tty():
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("this command needs an interactive terminal.", file=sys.stderr)
+        print("run it directly in your shell (not piped, not inside the agent).",
+              file=sys.stderr)
+        print("tip: `csess ls` lists without a TTY; "
+              "`csess resume <id|label>` resumes directly.", file=sys.stderr)
+        sys.exit(2)
+
+
+def _render_row(e, width):
+    live = "" if find_live_transcript(e["id"]) else " [archived]"
+    label = e.get("label", "(no label)")
+    head = f"{reltime(e['_last']):>9}  {label}{live}"
+    return head[:width]
+
+
+def picker(entries, multiselect=False, title="select a session"):
+    import curses
+
+    selected = set()
+    idx = [0]
+
+    def run(stdscr):
+        curses.curs_set(0)
+        try:
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(2, curses.COLOR_CYAN, -1)
+        except curses.error:
+            pass
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            hint = ("space=toggle  enter=confirm  a=all  q=cancel"
+                    if multiselect else
+                    "enter=resume  q=cancel   (arrows / j k to move)")
+            stdscr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
+            stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
+            top = 3
+            rows = h - top - 1
+            start = max(0, idx[0] - rows + 1)
+            for i, e in enumerate(entries[start:start + rows]):
+                real = start + i
+                y = top + i
+                box = ("[x] " if real in selected else "[ ] ") if multiselect else ""
+                line = box + _render_row(e, w - len(box) - 2)
+                if real == idx[0]:
+                    stdscr.attron(curses.color_pair(1))
+                    stdscr.addnstr(y, 0, line.ljust(w - 1), w - 1)
+                    stdscr.attroff(curses.color_pair(1))
+                else:
+                    stdscr.addnstr(y, 0, line, w - 1)
+            # detail of current row
+            cur = entries[idx[0]]
+            detail_y = top + min(len(entries), rows) + 0
+            if detail_y < h - 1:
+                stdscr.attron(curses.color_pair(2))
+                stdscr.addnstr(h - 1, 0, f" {cur.get('cwd','')}  ::  "
+                               f"{cur.get('preview','')[:w-4]}", w - 1)
+                stdscr.attroff(curses.color_pair(2))
+            stdscr.refresh()
+
+            c = stdscr.getch()
+            if c in (curses.KEY_DOWN, ord("j")):
+                idx[0] = min(len(entries) - 1, idx[0] + 1)
+            elif c in (curses.KEY_UP, ord("k")):
+                idx[0] = max(0, idx[0] - 1)
+            elif c in (curses.KEY_HOME, ord("g")):
+                idx[0] = 0
+            elif c in (curses.KEY_END, ord("G")):
+                idx[0] = len(entries) - 1
+            elif multiselect and c == ord(" "):
+                selected.symmetric_difference_update({idx[0]})
+            elif multiselect and c == ord("a"):
+                if len(selected) == len(entries):
+                    selected.clear()
+                else:
+                    selected.update(range(len(entries)))
+            elif c in (curses.KEY_ENTER, 10, 13):
+                return "confirm"
+            elif c in (ord("q"), 27):
+                return "cancel"
+
+    import curses
+    result = curses.wrapper(run)
+    if result == "cancel":
+        return None
+    if multiselect:
+        return [entries[i] for i in sorted(selected)]
+    return entries[idx[0]]
+
+
+def cmd_list(args):
+    entries = sorted_entries()
+    if not entries:
+        print("no kept sessions yet. inside a session run `/keep` to save one.")
+        return 0
+    _require_tty()
+    chosen = picker(entries, multiselect=False,
+                    title=f"kept sessions ({len(entries)}) - newest first")
+    if not chosen:
+        print("cancelled.")
+        return 0
+    return do_resume(chosen)
+
+
+def cmd_prune(args):
+    entries = sorted_entries()
+    if not entries:
+        print("nothing to prune.")
+        return 0
+    _require_tty()
+    chosen = picker(entries, multiselect=True,
+                    title=f"prune sessions ({len(entries)}) - select to DELETE")
+    if not chosen:
+        print("cancelled. nothing removed.")
+        return 0
+    refs = [e["id"] for e in chosen]
+    print("about to delete:")
+    for e in chosen:
+        print(f"  - {e.get('label')} ({e['id']})")
+    try:
+        ans = input("confirm? [y/N] ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans != "y":
+        print("aborted.")
+        return 0
+    args.refs = refs
+    return cmd_rm(args)
+
+
+# ---------- entrypoint ----------
+
+def main():
+    p = argparse.ArgumentParser(prog="csess", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("save", help="register/refresh a kept session")
+    sp.add_argument("--id")
+    sp.add_argument("--cwd")
+    sp.add_argument("--label")
+    sp.add_argument("--summary-file")
+    sp.set_defaults(func=cmd_save)
+
+    sub.add_parser("ls", help="plain text list").set_defaults(func=cmd_ls)
+    sub.add_parser("list", help="arrow-key picker -> resume").set_defaults(func=cmd_list)
+    sub.add_parser("prune", help="multi-select picker -> delete").set_defaults(func=cmd_prune)
+
+    rp = sub.add_parser("resume", help="resume a session by id or label")
+    rp.add_argument("ref")
+    rp.set_defaults(func=cmd_resume)
+
+    dp = sub.add_parser("rm", help="delete sessions by id or label (no picker)")
+    dp.add_argument("refs", nargs="+")
+    dp.set_defaults(func=cmd_rm)
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        # bare `csess` -> the picker
+        return cmd_list(argparse.Namespace())
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
