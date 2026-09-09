@@ -1,4 +1,4 @@
-# csess — keep & hydrate long-lived Claude Code sessions
+# csess - keep & hydrate long-lived Claude Code sessions
 
 A zero-dependency tool (Python stdlib only) for preserving the Claude Code
 sessions you don't want to lose across machine restarts, browsing them with an
