@@ -8,11 +8,13 @@ can't silently delete it, and gives an arrow-key picker to resume one.
 Layout (~/.claude/csess/):
   index.json            registry of kept sessions
   transcripts/<id>.jsonl  preserved copy of each kept transcript
+  transcripts/<id>/       preserved sidecar dir (subagents/, tool-results/)
   summaries/<id>.md       human/agent-written summary of the session
 
 Usage:
   csess                       arrow-key picker -> resume the chosen session
   csess ls                    plain text list (no TTY needed)
+  csess show <id|label>       print the saved summary for a session
   csess prune                 multi-select picker -> delete chosen sessions
   csess resume <id|label>     resume a specific session directly
   csess rm <id|label> ...     delete specific sessions (no picker)
@@ -75,9 +77,15 @@ def find_live_transcript(session_id):
     return hits[0] if hits else None
 
 
+def sidecar_for(transcript_path):
+    """Claude Code keeps a per-session dir next to the transcript
+    (<id>/subagents/*.jsonl, <id>/tool-results/*.txt). Same path, no suffix."""
+    return transcript_path[:-len(".jsonl")]
+
+
 def slug_for_cwd(cwd):
-    """Mirror Claude Code's project-dir naming: '/' and '.' -> '-'."""
-    return re.sub(r"[/.]", "-", cwd)
+    """Mirror Claude Code's project-dir naming: '/', '.' and '_' -> '-'."""
+    return re.sub(r"[/._]", "-", cwd)
 
 
 def project_dir_for(entry):
@@ -88,6 +96,20 @@ def project_dir_for(entry):
 
 def preserved_path(session_id):
     return os.path.join(TRANSCRIPTS, f"{session_id}.jsonl")
+
+
+def preserved_sidecar(session_id):
+    return os.path.join(TRANSCRIPTS, session_id)
+
+
+def copy_sidecar(src_dir, dst_dir):
+    """Mirror a sidecar dir exactly (replace any stale preserved copy)."""
+    if not os.path.isdir(src_dir):
+        return False
+    if os.path.isdir(dst_dir):
+        shutil.rmtree(dst_dir)
+    shutil.copytree(src_dir, dst_dir)
+    return True
 
 
 def summary_path(session_id):
@@ -183,7 +205,7 @@ def find_entry(entries, ref):
         matches = [e for e in entries if ref.lower() in e.get("label", "").lower()]
         if len(matches) == 1:
             return matches[0]
-    return None if len(matches) != 1 else matches[0]
+    return None
 
 
 # ---------- commands ----------
@@ -202,6 +224,7 @@ def cmd_save(args):
     # preserve a copy so auto-cleanup can't delete it
     if live:
         shutil.copy2(live, preserved_path(session_id))
+        copy_sidecar(sidecar_for(live), preserved_sidecar(session_id))
         preview = first_user_message(live)
     elif os.path.exists(preserved_path(session_id)):
         preview = first_user_message(preserved_path(session_id))
@@ -212,6 +235,13 @@ def cmd_save(args):
 
     if args.summary_file and os.path.exists(args.summary_file):
         shutil.copy2(args.summary_file, summary_path(session_id))
+        # /keep hands us a private mktemp file; tidy it up once it's copied
+        tmpdir = os.path.realpath(tempfile.gettempdir())
+        if os.path.realpath(args.summary_file).startswith(tmpdir + os.sep):
+            try:
+                os.remove(args.summary_file)
+            except OSError:
+                pass
 
     entries = load_index()
     existing = next((e for e in entries if e["id"] == session_id), None)
@@ -234,6 +264,8 @@ def cmd_save(args):
     save_index(entries)
     print(f"kept: {label}  ({session_id})")
     print(f"  transcript preserved -> {preserved_path(session_id)}")
+    if os.path.isdir(preserved_sidecar(session_id)):
+        print(f"  sidecar preserved    -> {preserved_sidecar(session_id)}/")
     if record["has_summary"]:
         print(f"  summary -> {summary_path(session_id)}")
     return 0
@@ -255,16 +287,22 @@ def cmd_ls(args):
 
 
 def restore_if_needed(entry):
-    """Make sure the transcript is back in the project dir so `claude -r` finds it."""
+    """Make sure the transcript (and its sidecar dir) is back in the project
+    dir so `claude -r` finds it."""
     pdir = project_dir_for(entry)
     target = os.path.join(pdir, f"{entry['id']}.jsonl")
+    restored = False
     if not os.path.exists(target):
         pres = preserved_path(entry["id"])
         if os.path.exists(pres):
             os.makedirs(pdir, exist_ok=True)
             shutil.copy2(pres, target)
-            return True
-    return False
+            restored = True
+    side_target = sidecar_for(target)
+    if not os.path.isdir(side_target):
+        if copy_sidecar(preserved_sidecar(entry["id"]), side_target):
+            restored = True
+    return restored
 
 
 def do_resume(entry):
@@ -293,6 +331,27 @@ def cmd_resume(args):
     return do_resume(e)
 
 
+def cmd_show(args):
+    entries = sorted_entries()
+    e = find_entry(entries, args.ref)
+    if not e:
+        print(f"no unique match for '{args.ref}'", file=sys.stderr)
+        return 1
+    live = "" if find_live_transcript(e["id"]) else "  [archived]"
+    print(f"{e.get('label')}  ({e['id']}){live}")
+    print(f"cwd: {e.get('cwd','')}   last activity: {reltime(e['_last'])}")
+    sp = summary_path(e["id"])
+    if not os.path.exists(sp):
+        print("\n(no summary saved for this session)")
+        if e.get("preview"):
+            print(f"first message: {e['preview']}")
+        return 0
+    print()
+    with open(sp) as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
 def cmd_rm(args):
     entries = load_index()
     removed = []
@@ -309,6 +368,7 @@ def cmd_rm(args):
                 os.remove(p)
             except OSError:
                 pass
+        shutil.rmtree(preserved_sidecar(e["id"]), ignore_errors=True)
     save_index(keep)
     if removed:
         for e in removed:
@@ -474,6 +534,10 @@ def main():
     rp = sub.add_parser("resume", help="resume a session by id or label")
     rp.add_argument("ref")
     rp.set_defaults(func=cmd_resume)
+
+    shp = sub.add_parser("show", help="print the saved summary for a session")
+    shp.add_argument("ref")
+    shp.set_defaults(func=cmd_show)
 
     dp = sub.add_parser("rm", help="delete sessions by id or label (no picker)")
     dp.add_argument("refs", nargs="+")
